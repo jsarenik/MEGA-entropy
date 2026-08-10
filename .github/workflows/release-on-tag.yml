@@ -1,0 +1,130 @@
+name: Release APK on tag
+
+on:
+  push:
+    # trigger on semantic version tags like v1.2.3
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # run only on tag refs (redundant with trigger but explicit)
+    if: startsWith(github.ref, 'refs/tags/')
+
+    permissions:
+      contents: write   # needed to create releases / upload assets
+
+    env:
+      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '11'       # change to 17 if your project requires it
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Install Android SDK commandline tools and accept licenses
+        run: |
+          set -e
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          cd /tmp
+          curl -sSfL "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip" -o cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools"/* "$ANDROID_SDK_ROOT/cmdline-tools/latest/" || true
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses
+          sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+
+      - name: Prepare release keystore (optional)
+        if: ${{ secrets.RELEASE_KEYSTORE != '' }}
+        run: |
+          # If you want to sign the release APK, provide a base64-encoded keystore in the secret RELEASE_KEYSTORE
+          # and the other secrets defined below. This decodes the keystore to a file the Gradle build can use.
+          echo "$RELEASE_KEYSTORE" | base64 --decode > release.keystore
+          echo "RELEASE_KEYSTORE_PATH=$PWD/release.keystore" >> $GITHUB_ENV
+        env:
+          RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE }}
+
+      - name: Build Release APK
+        env:
+          ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+          ANDROID_HOME: ${{ runner.temp }}/android-sdk
+          PATH: ${{ runner.temp }}/android-sdk/cmdline-tools/latest/bin:$PATH
+          # optional signing secrets (used only if you set them in repo secrets)
+          RELEASE_KEYSTORE_PATH: ${{ env.RELEASE_KEYSTORE_PATH }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -e
+          # If you provided signing secrets, inject them into the gradle invocation so the APK is signed.
+          if [ -n "$RELEASE_KEYSTORE_PATH" ]; then
+            echo "Building signed release APK..."
+            ./gradlew assembleRelease \
+              -Pandroid.injected.signing.store.file="$RELEASE_KEYSTORE_PATH" \
+              -Pandroid.injected.signing.store.password="$RELEASE_KEYSTORE_PASSWORD" \
+              -Pandroid.injected.signing.key.alias="$RELEASE_KEY_ALIAS" \
+              -Pandroid.injected.signing.key.password="$RELEASE_KEY_PASSWORD" \
+              --no-daemon --stacktrace
+          else
+            echo "No signing keystore provided. Building unsigned release APK..."
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          fi
+
+      - name: Locate release APK/AAB
+        run: |
+          set -e
+          # find the first APK/AAB that looks like a release build
+          APK=$(find . -type f -path "*/build/outputs/**/*.apk" -name "*release*.apk" -print -quit || true)
+          AAB=$(find . -type f -path "*/build/outputs/**/*.aab" -name "*release*.aab" -print -quit || true)
+          if [ -n "$APK" ]; then
+            echo "RELEASE_ASSET=$APK" >> $GITHUB_ENV
+            echo "Found APK: $APK"
+          elif [ -n "$AAB" ]; then
+            echo "RELEASE_ASSET=$AAB" >> $GITHUB_ENV
+            echo "Found AAB: $AAB"
+          else
+            echo "No release APK/AAB found under build/outputs." >&2
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          body: Automated release for ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release asset (APK/AAB)
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ env.RELEASE_ASSET }}
+          asset_name: ${{ github.ref_name }}-${{ github.run_id }}-$(basename ${{ env.RELEASE_ASSET }})
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
